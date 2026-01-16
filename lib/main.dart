@@ -3,15 +3,23 @@ import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart'; // Add to pubspec.yaml: intl: ^0.19.0
 import 'firebase_options.dart';
 import 'package:auth_buttons/auth_buttons.dart';
+
+import 'package:billtrack/screens/onboarding_screen.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   await NotificationService().init();
-  runApp(const BillWiseApp());
+
+  final prefs = await SharedPreferences.getInstance();
+  final showOnboarding = !prefs.containsKey('onboarding_seen');
+
+  runApp(BillWiseApp(showOnboarding: showOnboarding));
 }
 
 // --- DATA MODEL ---
@@ -30,7 +38,53 @@ class Bill {
     this.isPaid = false,
   });
 
+  Map<String, dynamic> toMap() {
+    return {
+      'category': category,
+      'amount': amount,
+      'dueDate': Timestamp.fromDate(dueDate),
+      'isPaid': isPaid,
+    };
+  }
+
+  factory Bill.fromMap(String id, Map<String, dynamic> map) {
+    return Bill(
+      id: id,
+      category: map['category'] ?? '',
+      amount: (map['amount'] ?? 0).toDouble(),
+      dueDate: (map['dueDate'] as Timestamp).toDate(),
+      isPaid: map['isPaid'] ?? false,
+    );
+  }
+
   int get daysUntilDue => dueDate.difference(DateTime.now()).inDays;
+}
+
+class FirestoreService {
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+
+  String get userId => FirebaseAuth.instance.currentUser!.uid;
+
+  Stream<List<Bill>> getBills() {
+    return _db
+        .collection('users')
+        .doc(userId)
+        .collection('bills')
+        .orderBy('dueDate')
+        .snapshots()
+        .map((snapshot) => snapshot.docs
+            .map((doc) => Bill.fromMap(doc.id, doc.data()))
+            .toList());
+  }
+
+  Future<void> addBill(Bill bill) async {
+    await _db
+        .collection('users')
+        .doc(userId)
+        .collection('bills')
+        .doc(bill.id)
+        .set(bill.toMap());
+  }
 }
 
 // --- THEME & CONSTANTS ---
@@ -42,7 +96,8 @@ class AppColors {
 }
 
 class BillWiseApp extends StatelessWidget {
-  const BillWiseApp({super.key});
+  final bool showOnboarding;
+  const BillWiseApp({super.key, required this.showOnboarding});
 
   @override
   Widget build(BuildContext context) {
@@ -60,6 +115,14 @@ class BillWiseApp extends StatelessWidget {
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const SplashScreen();
           }
+          // Check if onboarding needs to be shown
+          if (showOnboarding && !snapshot.hasData) {
+            // Only show onboarding if user is NOT logged in.
+            // If they are logged in, we assume they know the drill or we don't want to disrupt them.
+            // Or strictly: if (showOnboarding) -> Onboarding, but usually onboarding leads to auth.
+            return const OnboardingScreen();
+          }
+
           if (snapshot.hasData) {
             return const MainNavigationHolder();
           }
@@ -324,43 +387,32 @@ class MainNavigationHolder extends StatefulWidget {
 class _MainNavigationHolderState extends State<MainNavigationHolder> {
   int _currentIndex = 0;
 
-  // App-wide state for bills
-  final List<Bill> _myBills = [
-    Bill(
-      id: '1',
-      category: 'Electricity',
-      amount: 85.50,
-      dueDate: DateTime.now().add(const Duration(days: 3)),
-    ),
-    Bill(
-      id: '2',
-      category: 'Water',
-      amount: 22.10,
-      dueDate: DateTime.now().add(const Duration(days: 7)),
-    ),
-    Bill(
-      id: '3',
-      category: 'Telecom',
-      amount: 45.00,
-      dueDate: DateTime.now().add(const Duration(days: 12)),
-    ),
-  ];
-
   void _addBill(Bill bill) {
-    if (!mounted) return; 
-  
-  setState(() => _myBills.add(bill));
+    FirestoreService().addBill(bill);
   }
 
   @override
   Widget build(BuildContext context) {
-    final List<Widget> screens = [
-      DashboardScreen(bills: _myBills),
-      AnalyticsScreen(bills: _myBills),
-    ];
-
     return Scaffold(
-      body: screens[_currentIndex],
+      body: StreamBuilder<List<Bill>>(
+        stream: FirestoreService().getBills(),
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(child: Text('Error: ${snapshot.error}'));
+          }
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final bills = snapshot.data ?? [];
+          final List<Widget> screens = [
+            DashboardScreen(bills: bills),
+            AnalyticsScreen(bills: bills),
+          ];
+
+          return screens[_currentIndex];
+        },
+      ),
       bottomNavigationBar: NavigationBar(
         backgroundColor: Colors.white,
         elevation: 10,
@@ -676,6 +728,22 @@ class AnalyticsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 1. Calculate totals per category
+    final Map<String, double> totals = {};
+    for (var bill in bills) {
+      totals[bill.category] = (totals[bill.category] ?? 0) + bill.amount;
+    }
+
+    // 2. Find max value for scaling bars
+    double maxTotal = 0;
+    if (totals.isNotEmpty) {
+      maxTotal = totals.values.reduce((a, b) => a > b ? a : b);
+    }
+
+    // 3. Prepare data for display (ensure we have all keys if needed, or just display what we have)
+    // We'll display specific categories or all found ones. Let's show all found ones.
+    // If no bills, show empty state or default 0.
+    
     return Scaffold(
       appBar: AppBar(title: const Text("Spending Trends")),
       body: Padding(
@@ -688,47 +756,75 @@ class AnalyticsScreen extends StatelessWidget {
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 30),
-            SizedBox(
-              height: 200,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  _buildBar("Elec", 0.8),
-                  _buildBar("Water", 0.4),
-                  _buildBar("Tel", 0.6),
-                ],
+            
+            if (bills.isEmpty)
+              const Center(child: Text("No data to display"))
+            else
+              SizedBox(
+                height: 200,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: totals.entries.map((e) {
+                    // Safe division
+                    double pct = maxTotal > 0 ? e.value / maxTotal : 0;
+                    return _buildBar(e.key, pct, e.value);
+                  }).toList(),
+                ),
               ),
-            ),
+
             const SizedBox(height: 40),
-            const Card(
-              child: ListTile(
-                leading: Icon(Icons.insights, color: AppColors.accent),
-                title: Text("Good Job!"),
-                subtitle: Text("Your spending is 12% lower than last month."),
-              ),
-            ),
+            _buildInsightsCard(bills, totals),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildBar(String label, double pct) {
+  Widget _buildBar(String label, double pct, double amount) {
     return Column(
       mainAxisAlignment: MainAxisAlignment.end,
       children: [
-        Container(
-          width: 40,
-          height: 150 * pct,
-          decoration: BoxDecoration(
-            color: AppColors.primary,
-            borderRadius: BorderRadius.circular(8),
+        Tooltip(
+          message: '\$${amount.toStringAsFixed(2)}',
+          child: Container(
+            width: 40,
+            height: 150 * pct,
+            decoration: BoxDecoration(
+              color: AppColors.primary,
+              borderRadius: BorderRadius.circular(8),
+            ),
           ),
         ),
         const SizedBox(height: 8),
-        Text(label),
+        Text(
+          label.length > 4 ? label.substring(0, 4) : label, // Truncate if long
+          style: const TextStyle(fontSize: 12),
+        ),
       ],
+    );
+  }
+
+  Widget _buildInsightsCard(List<Bill> bills, Map<String, double> totals) {
+    // Simple insight logic
+    double totalSpent = bills.fold(0, (sum, b) => sum + b.amount);
+    String topCategory = '';
+    double topAmount = 0;
+    
+    if (totals.isNotEmpty) {
+       var maxEntry = totals.entries.reduce((a, b) => a.value > b.value ? a : b);
+       topCategory = maxEntry.key;
+       topAmount = maxEntry.value;
+    }
+
+    return Card(
+      child: ListTile(
+        leading: const Icon(Icons.insights, color: AppColors.accent),
+        title: Text("Total: \$${totalSpent.toStringAsFixed(2)}"),
+        subtitle: topCategory.isNotEmpty 
+            ? Text("Most spending on $topCategory (\$${topAmount.toStringAsFixed(0)})")
+            : const Text("Track your bills to see insights!"),
+      ),
     );
   }
 }
